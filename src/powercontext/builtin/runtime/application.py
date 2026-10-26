@@ -489,6 +489,7 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
+            self._wake_processing()
             return SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
@@ -505,8 +506,13 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
+            self._wake_processing()
             return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
 
+    def _wake_processing(self) -> None:
+        supervisor = self._runtime.artifact_processing_supervisor
+        if supervisor is not None:
+            supervisor.wake()
 
 class SourceApplication:
     """Select a scoped Source application service."""
@@ -564,7 +570,14 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        self._wake_processing()
+        return created
+
+    def _wake_processing(self) -> None:
+        supervisor = self._runtime.artifact_processing_supervisor
+        if supervisor is not None:
+            supervisor.wake()
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -980,6 +993,9 @@ class ScopedContextApplication:
                 round_zero=round_zero,
             )
         code = await self._code_candidates(request) if request.include_code else ()
+        topic_memory_hits = await self._runtime.lifecycle.for_scope(self.scope_id).filter_topic_hits(
+            topic_memory_hits
+        )
         with self._runtime._stage(
             "context.build",
             attributes={
@@ -2685,6 +2701,7 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+        result = await self._runtime.lifecycle.for_scope(self.scope_id).filter_topic_result(result)
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -2796,7 +2813,8 @@ class ScopedTopicMemoryApplication:
         if not 1 <= limit <= 100:
             raise InvalidRuntimeRequestError("topic-memory-browse-limit")
         async with self._runtime._scoped_operation(self.scope_id):
-            return await self._runtime._topic_memory_browse(self.scope_id, limit=limit, after=after)
+            items = await self._runtime._topic_memory_browse(self.scope_id, limit=limit, after=after)
+        return await self._runtime.lifecycle.for_scope(self.scope_id).filter_topic_items(items)
 
     async def flush(self) -> TopicMemoryFlushResult:
         if not self._runtime._topic_memory_processing_available or self._runtime._topic_memory_flush is None:
@@ -3128,6 +3146,9 @@ class BuiltinRuntime:
         self.work = WorkApplication(self)
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
+        from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
+
+        self.lifecycle = SourceLifecycleApplication(self)
         self.records = RecordApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
