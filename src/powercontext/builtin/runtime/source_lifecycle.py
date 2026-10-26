@@ -81,11 +81,14 @@ class ScopedSourceLifecycle:
     def __init__(self, runtime: Any, scope_id: str) -> None:
         self._runtime = runtime
         self.scope_id = scope_id
-        self._database = runtime._provider.database
+        self._database = getattr(runtime._provider, "database", None)
         self._ready = False
 
     async def _ensure(self) -> None:
         if self._ready:
+            return
+        if self._database is None:
+            self._ready = True
             return
         async with self._database.transaction() as connection:
             await connection.execute(
@@ -110,6 +113,8 @@ class ScopedSourceLifecycle:
         self._ready = True
 
     async def _load_all(self, connection: AsyncConnection) -> dict[str, _LifecycleRow]:
+        if self._database is None:
+            raise SourceLifecycleError("lifecycle storage is unavailable")
         rows = (
             await connection.execute(
                 text("SELECT * FROM pc_source_lifecycle_nodes WHERE scope_id = :scope_id"),
@@ -119,6 +124,8 @@ class ScopedSourceLifecycle:
         return {str(row["node_id"]): self._decode(row) for row in rows}
 
     async def _load_one(self, connection: AsyncConnection, node_id: str) -> _LifecycleRow | None:
+        if self._database is None:
+            raise SourceLifecycleError("lifecycle storage is unavailable")
         row = (
             await connection.execute(
                 text(
@@ -145,6 +152,8 @@ class ScopedSourceLifecycle:
         )
 
     async def _write(self, connection: AsyncConnection, row: _LifecycleRow) -> None:
+        if self._database is None:
+            raise SourceLifecycleError("lifecycle storage is unavailable")
         values = {
             "scope_id": row.scope_id,
             "node_id": row.node_id,
@@ -335,16 +344,22 @@ class ScopedSourceLifecycle:
         return ArtifactRef.model_validate(node.binding["artifact_ref"])
 
     async def filter_topic_hits(self, hits: tuple[Any, ...]) -> tuple[Any, ...]:
+        if self._database is None:
+            return hits
         inactive = await self._inactive_topic_ids()
         if not inactive:
             return hits
         return tuple(hit for hit in hits if hit.artifact_ref.artifact_id not in inactive)
 
     async def filter_topic_result(self, result: Any) -> Any:
+        if self._database is None:
+            return result
         hits = await self.filter_topic_hits(result.hits)
         return result if hits is result.hits else result.model_copy(update={"hits": hits})
 
     async def filter_topic_items(self, items: tuple[Any, ...]) -> tuple[Any, ...]:
+        if self._database is None:
+            return items
         inactive = await self._inactive_topic_ids()
         if not inactive:
             return items
@@ -354,6 +369,8 @@ class ScopedSourceLifecycle:
         return artifact_id not in await self._inactive_topic_ids()
 
     async def _inactive_topic_ids(self) -> set[str]:
+        if self._database is None:
+            return set()
         await self._ensure()
         async with self._database.transaction() as connection:
             rows = (
