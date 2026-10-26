@@ -218,6 +218,10 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
         "battl": ("proceedings", "litigation", "claims"),
         "restru": ("impairment", "charges"),
         "unadju": ("operating", "profit", "income"),
+        "categor": ("segment", "revenue", "product", "service"),
+        "tax": ("income", "expense", "benefit"),
+        "margin": ("gross", "profit", "revenue", "operating"),
+        "segment": ("segment", "revenue"),
     }
     for term in list(query_counts):
         for extra in expansions.get(term, ()):
@@ -231,10 +235,23 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
             query_counts[canonical(extra)] += 0.8
     scored: list[tuple[float, int, Any]] = []
     forced: list[tuple[float, int, Any]] = []
-    statement_query = any(
-        key in question_lower
-        for key in ("cash flow", "income statement", "p&l", "ebitda", "margin", "capex", "profit", "revenue")
-    )
+    def force_page(text: str) -> bool:
+        if any(key in question_lower for key in ("cash flow", "capex", "capital expenditure", "depreciation", "amortization")):
+            if "consolidated statement of cash flows" in text:
+                return True
+        if any(key in question_lower for key in ("income", "margin", "tax", "profit", "operations", "ebitda", "revenue")):
+            if any(title in text for title in ("consolidated statements of operations", "consolidated statement of operations", "consolidated statement of income", "consolidated statements of income", "statement of operations")):
+                return True
+        if any(key in question_lower for key in ("balance sheet", "assets", "liabilities", "equity")):
+            if "consolidated balance sheet" in text:
+                return True
+        if any(key in question_lower for key in ("segment", "category", "categories", "product", "service", "revenue")):
+            if any(title in text for title in ("business segment data", "segment information", "segment results")):
+                return True
+        if any(key in question_lower for key in ("legal", "litigation", "battle", "lawsuit", "claim", "proceeding")):
+            if any(title in text for title in ("legal proceeding", "legal action", "litigation", "contingencies")):
+                return True
+        return False
     for (citation, text, page), document in zip(records, documents, strict=True):
         frequencies = Counter(document)
         length = len(document)
@@ -257,10 +274,7 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
             or "margin" in question_lower
         ) and "consolidated statement of income" in page_text:
             score += 8.0
-        if statement_query and (
-            "consolidated statement of cash flows" in page_text
-            or "consolidated statement of income" in page_text
-        ):
+        if force_page(page_text):
             forced.append((1_000_000.0, page, citation))
         if score > 0:
             scored.append((score, page, citation))
@@ -271,7 +285,7 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
     selected: list[tuple[float, Any]] = [(score, citation) for score, _, citation in forced]
     seen_pages: set[int] = {page for _, page, _ in forced}
     for score, page, citation in scored[: max(8, limit)]:
-        for neighbor in (page, page - 1, page + 1, page - 2, page + 2):
+        for neighbor in (page, page - 1, page + 1, page - 2, page + 2, page - 3, page + 3, page - 4, page + 4):
             item = by_page.get(neighbor)
             if item is not None and neighbor not in seen_pages:
                 seen_pages.add(neighbor)
