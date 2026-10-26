@@ -245,8 +245,14 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
         if any(key in question_lower for key in ("balance sheet", "assets", "liabilities", "equity")):
             if "consolidated balance sheet" in text:
                 return True
+        if any(key in question_lower for key in ("capital", "intensive", "balance sheet", "asset")):
+            if any(title in text for title in ("consolidated balance sheet", "consolidated statement of cash flows", "consolidated statement of income")):
+                return True
+        if any(key in question_lower for key in ("operating margin", "margin", "results of operations", "operating income")):
+            if "results of operations" in text:
+                return True
         if any(key in question_lower for key in ("segment", "category", "categories", "product", "service", "revenue")):
-            if any(title in text for title in ("business segment data", "segment information", "segment results")):
+            if any(title in text for title in ("business segment data", "segment information", "segment results", "by business segment", "business segment")):
                 return True
         if any(key in question_lower for key in ("legal", "litigation", "battle", "lawsuit", "claim", "proceeding")):
             if any(title in text for title in ("legal proceeding", "legal action", "litigation", "contingencies")):
@@ -275,21 +281,83 @@ async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple
         ) and "consolidated statement of income" in page_text:
             score += 8.0
         if force_page(page_text):
-            forced.append((1_000_000.0, page, citation))
+            priority = 1_000_000.0 + score
+            if any(marker in page_text for marker in (
+                "sales and operating income (loss) by business segment",
+                "consolidated statement of income",
+                "consolidated statements of operations",
+                "consolidated statement of operations",
+                "consolidated balance sheet",
+                "consolidated statement of cash flows",
+                "results of operations",
+                "summary of business segment data",
+            )):
+                priority += 100_000.0
+            forced.append((priority, page, citation, page_text))
         if score > 0:
             scored.append((score, page, citation))
     scored.sort(key=lambda item: item[0], reverse=True)
-    by_page: dict[int, tuple[float, Any]] = {}
+    by_page: dict[int, tuple[float, Any]] = {
+        page: (0.0, citation) for citation, _, page in records
+    }
     for score, page, citation in scored:
-        by_page.setdefault(page, (score, citation))
-    selected: list[tuple[float, Any]] = [(score, citation) for score, _, citation in forced]
-    seen_pages: set[int] = {page for _, page, _ in forced}
-    for score, page, citation in scored[: max(8, limit)]:
-        for neighbor in (page, page - 1, page + 1, page - 2, page + 2, page - 3, page + 3, page - 4, page + 4):
+        by_page[page] = (score, citation)
+    if any(key in question_lower for key in ("customer", "geograph", "cyclical")):
+        prefix = [by_page[page][1] for page in range(1, limit + 1) if page in by_page]
+        if prefix:
+            return tuple(prefix[:limit])
+    forced.sort(key=lambda item: item[0], reverse=True)
+    markers = (
+        "sales and operating income (loss) by business segment",
+        "summary of business segment data",
+        "consolidated statement of income",
+        "consolidated statements of operations",
+        "consolidated statement of operations",
+        "consolidated balance sheet",
+        "consolidated statement of cash flows",
+        "results of operations",
+        "legal proceeding",
+        "legal action",
+        "litigation",
+    )
+    selected: list[tuple[float, Any]] = []
+    seen_pages: set[int] = set()
+    top = scored[:10]
+    for score, page, citation in top:
+        if page not in seen_pages:
+            seen_pages.add(page)
+            selected.append((score, citation))
+    exact: dict[int, tuple[float, Any]] = {}
+    for _, page, citation, page_text in forced:
+        if any(marker in page_text[:400] for marker in markers):
+            exact[page] = by_page.get(page, (0.0, citation))
+    for page, item in sorted(exact.items(), key=lambda pair: pair[1][0], reverse=True):
+        if len(selected) >= limit:
+            break
+        if page not in seen_pages:
+            seen_pages.add(page)
+            selected.append(item)
+
+    if scored and len(selected) < limit:
+        for center in sorted({page for _, page, _ in top}):
+            for page in range(max(1, center - 4), center + 5):
+                item = by_page.get(page)
+                if item is not None and page not in seen_pages:
+                    seen_pages.add(page)
+                    selected.append(item)
+                    if len(selected) >= limit:
+                        break
+            if len(selected) >= limit:
+                break
+    for distance in (1, -1, 2, -2, 3, -3, 4, -4):
+        for _, page, _ in top:
+            neighbor = page + distance
             item = by_page.get(neighbor)
             if item is not None and neighbor not in seen_pages:
                 seen_pages.add(neighbor)
                 selected.append(item)
+                if len(selected) >= limit:
+                    break
         if len(selected) >= limit:
             break
     if len(selected) < limit:
