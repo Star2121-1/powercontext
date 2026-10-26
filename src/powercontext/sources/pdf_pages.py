@@ -162,34 +162,42 @@ PDF_PAGE_SOURCE_DEFINITION: SourceDefinition[PDFPageInput, PDFPageSource, PDFPag
 async def search_pdf_pages(memory: Any, question: str, limit: int = 10) -> tuple[Any, ...]:
     """Return exact page citations for a natural-language question."""
 
+    import re
+
     from powercontext.builtin.artifacts.memory.models import MemoryCitation
     from powercontext.builtin.runtime.models import SearchMemoryRequest
 
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("limit must be a positive integer")
     page = await memory.search(SearchMemoryRequest(query=question, mode="fts", limit=max(limit * 5, 50)))
-    seen: set[tuple[str, int, str, str]] = set()
-    citations: list[Any] = []
+    query_terms = set(re.findall(r"[a-z]+|\d+", question.lower()))
+    scored: dict[tuple[str, int, str, str], tuple[float, Any]] = {}
     for hit in page.hits:
-        key = (
-            hit.memory_ref.family,
-            hit.memory_ref.artifact_id,
-            hit.entry_id,
-            hit.entry_version_id,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        citations.append(
+        key = (hit.memory_ref.family, hit.memory_ref.artifact_id, hit.entry_id, hit.entry_version_id)
+        overlap = len(query_terms & set(re.findall(r"[a-z]+|\d+", hit.text.lower())))
+        score = float(overlap)
+        scored[key] = (
+            score,
             MemoryCitation(
                 memory_ref=hit.memory_ref,
                 entry_id=hit.entry_id,
                 entry_version_id=hit.entry_version_id,
-            )
+            ),
         )
-        if len(citations) >= limit:
-            break
-    return tuple(citations)
+    listed = await memory.list()
+    for record in listed.entries:
+        citation = record.citation
+        key = (
+            citation.memory_ref.family,
+            citation.memory_ref.artifact_id,
+            citation.entry_id,
+            citation.entry_version_id,
+        )
+        overlap = len(query_terms & set(re.findall(r"[a-z]+|\d+", record.entry.text.lower())))
+        if overlap > 0 and (key not in scored or float(overlap) > scored[key][0]):
+            scored[key] = (float(overlap), citation)
+    ordered = sorted(scored.values(), key=lambda item: item[0], reverse=True)
+    return tuple(citation for _, citation in ordered[:limit])
 
 
 __all__ = [
