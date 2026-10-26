@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -56,6 +57,8 @@ class _PreparedContextEntry:
     citation: dict[str, object]
     content: str
     truncated: bool
+    start: int | None = None
+    end: int | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +109,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[MemoryFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,16 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class MemoryFragment:
+    """One literal character span selected from a Memory entry."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -234,6 +248,11 @@ class PreparedContextBuilder:
             raise PreparedContextInvariantError("topic-memory-candidate-limit")
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
+        if request.evidence_selection:
+            return self._build_evidence_selection(
+                request=request,
+                memory_candidates=memory_candidates,
+            )
 
         content, origins, omissions = self._select_entries(
             request=request,
@@ -254,6 +273,65 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _build_evidence_selection(
+        self,
+        *,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        query_tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", request.query.lower()))
+        candidates: list[tuple[float, int, MemoryEntryAddress, int, int, str]] = []
+        order = 0
+        for group in memory_candidates:
+            for hit in group.hits:
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                for start, end in _sentence_spans(hit.text):
+                    text = hit.text[start:end]
+                    tokens = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", text.lower()))
+                    score = float(len(tokens & query_tokens))
+                    if request.query.lower() in text.lower():
+                        score += 1.0
+                    candidates.append((score, order, address, start, end, text))
+                    order += 1
+        if not candidates:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        entries: list[_PreparedContextEntry] = []
+        fragments: list[MemoryFragment] = []
+        for _, _, address, start, end, text in candidates:
+            citation = {
+                "scope_id": address.memory.scope_id,
+                "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                "entry_id": address.entry_id,
+                "entry_version_id": address.entry_version_id,
+            }
+            entry = _PreparedContextEntry(
+                origin=address,
+                kind="memory",
+                citation=citation,
+                content=text,
+                truncated=False,
+                start=start,
+                end=end,
+            )
+            trial = (*entries, entry)
+            if _rendered_bytes(trial) > request.max_bytes:
+                continue
+            entries.append(entry)
+            fragments.append(MemoryFragment(address=address, start=start, end=end, text=text))
+        if not entries:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = _render(entries)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=tuple(fragment.address for fragment in fragments),
+            fragments=tuple(fragments),
         )
 
     def probe_budget(
@@ -685,6 +763,28 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     return tuple(ordered)
 
 
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for match in re.finditer(r"[.!?。！？](?:\s+|$)", text):
+        end = match.end()
+        raw = text[cursor:end]
+        left = len(raw) - len(raw.lstrip())
+        right = len(raw.rstrip())
+        if right > left:
+            spans.append((cursor + left, cursor + right))
+        cursor = end
+    if cursor < len(text):
+        raw = text[cursor:]
+        left = len(raw) - len(raw.lstrip())
+        right = len(raw.rstrip())
+        if right > left:
+            spans.append((cursor + left, cursor + right))
+    if not spans and text.strip():
+        spans.append((len(text) - len(text.lstrip()), len(text.rstrip())))
+    return spans
+
+
 def _render(entries: Sequence[_PreparedContextEntry]) -> str:
     envelope = {
         "trust": "untrusted_history",
@@ -715,6 +815,9 @@ def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
         "content": entry.content,
         "truncated": entry.truncated,
     }
+    if entry.start is not None and entry.end is not None:
+        rendered["start"] = entry.start
+        rendered["end"] = entry.end
     if entry.kind != "memory":
         rendered["kind"] = entry.kind
     return rendered
