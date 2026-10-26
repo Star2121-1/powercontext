@@ -92,8 +92,8 @@ class ScopedSourceLifecycle:
                 text(
                     """
                     CREATE TABLE IF NOT EXISTS pc_source_lifecycle_nodes (
-                        scope_id VARCHAR(512) NOT NULL,
-                        node_id VARCHAR(512) NOT NULL,
+                        scope_id VARCHAR(191) NOT NULL,
+                        node_id VARCHAR(255) NOT NULL,
                         kind VARCHAR(16) NOT NULL,
                         parents TEXT NOT NULL,
                         policy VARCHAR(8) NOT NULL,
