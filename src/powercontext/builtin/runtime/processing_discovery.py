@@ -53,6 +53,14 @@ class SourceProcessingPendingProvider:
         self._binding = binding_name
         self._family = artifact_family
 
+    async def pending_source_count(self, connection: AsyncConnection, scope_id: str, /) -> int:
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        high = await connection.scalar(select(heads.c.position).where(heads.c.scope_id == scope_id))
+        if high is None:
+            return 0
+        cursor = await SourceCursorRepository().load(connection, scope_id, self._binding)
+        return max(0, int(high) - (0 if cursor is None else cursor.cursor.sequence))
+
     async def reconcile(self, after_scope_id: str | None, limit: int, *, fence: ArtifactProcessingFence) -> str | None:
         heads = SOURCE_JOURNAL_HEADS_TABLE
         statement = select(heads.c.scope_id, heads.c.position).order_by(heads.c.scope_id).limit(limit)
